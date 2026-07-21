@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "azure-devops-remote": {
+      "url": "https://mcp.dev.azure.com/Rapid-AI-Team",
+      "headers": {
+        "X-MCP-Readonly": "false"
+      }
+    }
+  }
+}

@@ -1,0 +1,671 @@
+import asyncio
+import os
+import sys
+import json
+import time
+import logging
+from typing import Dict, List, Any, AsyncGenerator, Optional, Tuple, Callable, Awaitable
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+import msal
+import httpx
+from google import genai
+from google.genai import types
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("azure-devops-agent-remote")
+
+# Load environment variables
+load_dotenv()
+
+# Configuration Validation Class
+class AppConfig:
+    def __init__(self) -> None:
+        self.gemini_api_key: str = self._get_required_env("GEMINI_API_KEY")
+        self.azure_devops_organization: str = os.getenv("AZURE_DEVOPS_ORGANIZATION", "Rapid-AI-Team")
+        self.default_project: str = os.getenv("AZURE_DEVOPS_PROJECT", "Pulse")
+        self.default_repo: str = os.getenv("AZURE_DEVOPS_REPOSITORY", "Pulse")
+        self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+        self.port: int = int(os.getenv("PORT", "8199"))
+
+    def _get_required_env(self, key: str) -> str:
+        val = os.getenv(key)
+        if not val:
+            logger.critical(f"Missing required environment variable: {key}")
+            raise RuntimeError(f"Configuration Error: {key} must be defined in your .env file.")
+        return val
+
+try:
+    config = AppConfig()
+except RuntimeError as err:
+    logger.critical(f"Server startup failed due to config errors: {err}")
+    sys.exit(1)
+
+from dataclasses import dataclass
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    inputSchema: dict
+
+@dataclass
+class ToolsResponse:
+    tools: List[Tool]
+
+@dataclass
+class Content:
+    text: str
+
+@dataclass
+class CallToolResponse:
+    content: List[Content]
+
+_token_cache = {"token": None, "expires_at": 0}
+
+def format_auth_header(token: str) -> str:
+    """
+    Formats the token correctly as a Bearer token.
+    """
+    token_str = token.strip()
+    if token_str.startswith("Bearer "):
+        return token_str
+    return f"Bearer {token_str}"
+
+async def get_auth_token() -> str:
+    """
+    Acquires an authentication token for Azure DevOps.
+    First tries loading the token from the local token.json file.
+    Finally, falls back to MSAL Client Credentials Flow if Entra credentials are set.
+    """
+    global _token_cache
+    current_time = time.time()
+    
+    # 1. Check local token.json
+    local_token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
+    if os.path.exists(local_token_path):
+        try:
+            with open(local_token_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                token = data.get("access_token") or data.get("token")
+                if token:
+                    logger.info("Using active token from local token.json file.")
+                    return token
+        except Exception as err:
+            logger.warning(f"Failed to read local token.json: {err}")
+
+    # 2. Check cached MSAL token
+    if _token_cache["token"] and current_time < _token_cache["expires_at"] - 60:
+        return _token_cache["token"]
+
+    # 3. Fallback: MSAL Client Credentials Flow
+    tenant_id = os.getenv("ENTRA_TENANT_ID")
+    client_id = os.getenv("ENTRA_CLIENT_ID")
+    client_secret = os.getenv("ENTRA_CLIENT_SECRET")
+    
+    if not (tenant_id and client_id and client_secret) or "here" in tenant_id or "here" in client_id:
+        logger.error("No valid Entra ID credentials found (no token.json or ENTRA_* settings).")
+        raise HTTPException(
+            status_code=500,
+            detail="Authentication failed. Please login using 'node auth.js'"
+        )
+
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    scope = ["499b84ac-1321-427f-aa17-267ca6975798/.default"]
+    
+    logger.info(f"[MSAL] Acquiring token for Entra tenant {tenant_id}...")
+    try:
+        app_conf = msal.ConfidentialClientApplication(
+            client_id,
+            authority=authority,
+            client_credential=client_secret
+        )
+        result = app_conf.acquire_token_for_client(scopes=scope)
+        
+        if "access_token" not in result:
+            err_msg = result.get("error_description") or result.get("error") or "Unknown OAuth error"
+            raise RuntimeError(err_msg)
+            
+        _token_cache["token"] = result["access_token"]
+        _token_cache["expires_at"] = current_time + result.get("expires_in", 3600)
+        logger.info("[MSAL] Token successfully acquired.")
+        return _token_cache["token"]
+    except Exception as e:
+        logger.error(f"[MSAL ERROR] Failed to fetch token: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"OAuth Token Acquisition failed: {str(e)}")
+
+# Compatibility alias for other scripts
+async def get_entra_token() -> str:
+    return await get_auth_token()
+
+class RemoteMCPClient:
+    """
+    A robust client class that implements JSON-RPC communication over HTTPS SSE 
+    with custom authorization and header options. Handles dynamic token rotation.
+    """
+    def __init__(self, remote_url: str, token: Optional[str] = None, default_headers: Optional[Dict[str, str]] = None) -> None:
+        if not remote_url.startswith("http"):
+            # Flexible: if remote_url is just the organization name, build the full URL
+            self.url = f"https://mcp.dev.azure.com/{remote_url}"
+        else:
+            self.url = remote_url
+            
+        self.token = token
+        self.default_headers = default_headers or {}
+
+    async def __aenter__(self) -> "RemoteMCPClient":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        pass
+
+    async def initialize(self) -> None:
+        pass
+
+    async def get_headers(self) -> Dict[str, str]:
+        token = self.token or await get_auth_token()
+        auth_header = format_auth_header(token)
+            
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": auth_header
+        }
+        headers.update(self.default_headers)
+        return headers
+
+    async def list_tools(self) -> ToolsResponse:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }
+        headers = await self.get_headers()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(self.url, json=payload, headers=headers, timeout=60.0)
+            if response.status_code != 200:
+                logger.error(f"Failed to list tools from remote server: HTTP {response.status_code}")
+                raise HTTPException(status_code=response.status_code, detail=f"Remote server error: {response.text}")
+            
+            data = response.text.strip()
+            if data.startswith("event:"):
+                lines = data.split("\n")
+                data_line = next((l for l in lines if l.startswith("data: ")), None)
+                if data_line:
+                    data = data_line[6:]
+            
+            res_json = json.loads(data)
+            if "error" in res_json:
+                raise RuntimeError(f"RPC Error: {res_json['error']}")
+            
+            tools_list = []
+            for t in res_json.get("result", {}).get("tools", []):
+                tools_list.append(Tool(t.get("name", ""), t.get("description", ""), t.get("inputSchema", {})))
+            
+            return ToolsResponse(tools_list)
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> CallToolResponse:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments
+            }
+        }
+        headers = await self.get_headers()
+        async with httpx.AsyncClient() as client:
+            response = await client.post(self.url, json=payload, headers=headers, timeout=60.0)
+            if response.status_code != 200:
+                logger.error(f"Failed to execute tool '{name}': HTTP {response.status_code}")
+                raise HTTPException(status_code=response.status_code, detail=f"Remote execution error: {response.text}")
+            
+            data = response.text.strip()
+            if data.startswith("event:"):
+                lines = data.split("\n")
+                data_line = next((l for l in lines if l.startswith("data: ")), None)
+                if data_line:
+                    data = data_line[6:]
+            
+            res_json = json.loads(data)
+            if "error" in res_json:
+                raise RuntimeError(f"RPC Error: {res_json['error']}")
+            
+            contents = []
+            for item in res_json.get("result", {}).get("content", []):
+                contents.append(Content(item.get("text", "")))
+            
+            return CallToolResponse(contents)
+
+# Global subagent role mapping configurations
+SUBAGENT_ROLES = {
+    "DevOps Engineer": {
+        "keywords": ["pipeline", "build", "run", "deploy", "release", "migration"],
+        "prefixes": ["core_", "pipelines_", "advsec_", "search_"],
+        "instruction": (
+            "You are the DevOps Engineer subagent. Your focus is CI/CD, builds, pipelines, and releases. "
+            "You only call tools related to build pipelines, log files, and migrations. "
+            "Ensure build failures are diagnosed using log files."
+        )
+    },
+    "QA Analyst": {
+        "keywords": ["test", "suite", "qa", "plan", "case"],
+        "prefixes": ["core_", "testplan_", "pipelines_", "search_"],
+        "instruction": (
+            "You are the QA Analyst subagent. Your focus is testing, test cases, test suites, and test plans. "
+            "You verify requirements and report test results. Minimize all other tool usage."
+        )
+    },
+    "Technical Writer": {
+        "keywords": ["wiki", "documentation", "page"],
+        "prefixes": ["core_", "wiki_", "search_"],
+        "instruction": (
+            "You are the Technical Writer subagent. Your focus is documenting features, searching wikis, "
+            "and writing high-quality Markdown documentation in wiki pages."
+        )
+    },
+    "Product Manager": {
+        "keywords": ["work item", "task", "bug", "story", "epic", "issue", "backlog", "query", "discussion", "comment", "link", "capacity", "sprint", "iteration", "board", "velocity", "assign", "create item", "add item", "new item", "feature"],
+        "prefixes": ["core_", "wit_", "work_", "search_"],
+        "instruction": (
+            "You are the Product Manager subagent. Your focus is backlogs, iteration sprints, capacity, work items, and descriptions. "
+            "You coordinate requirements and update work items on the Azure Board."
+        )
+    },
+    "Software Developer": {
+        "keywords": ["repo", "repository", "branch", "commit", "pull request", "pr", "merge", "file", "diff", "code review", "clone", "push", "git"],
+        "prefixes": ["core_", "repo_", "wit_", "search_"],
+        "instruction": (
+            "You are the Software Developer subagent. Your focus is code repositories, branches, pull requests, files, and git commits. "
+            "You review diffs, browse files, and check branch statuses."
+        )
+    },
+    "General Assistant": {
+        "keywords": [],
+        "prefixes": ["core_", "wit_", "work_", "repo_", "pipelines_", "wiki_", "testplan_", "advsec_", "search_"],
+        "instruction": (
+            "You are a general Azure DevOps assistant. You have access to all available tools across "
+            "work items, repositories, pipelines, wikis, test plans, and project management. "
+            "Choose the most appropriate tools to answer the user's request accurately."
+        )
+    }
+}
+
+def get_remote_config() -> Tuple[str, Dict[str, str]]:
+    local_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(local_dir, "mcp_config.json")
+    
+    if not os.path.exists(config_path):
+        logger.error(f"Local mcp_config.json configuration file not found at {config_path}")
+        raise FileNotFoundError(f"Configuration file 'mcp_config.json' not found locally in {local_dir}")
+        
+    with open(config_path, "r", encoding="utf-8") as f:
+        mcp_data = json.load(f)
+        
+    servers = mcp_data.get("mcpServers", {})
+    if "azure-devops-remote" not in servers:
+        logger.error("Configuration block 'azure-devops-remote' is missing from local mcp_config.json")
+        raise KeyError("Invalid config: 'azure-devops-remote' block is required in mcp_config.json")
+        
+    remote_srv = servers["azure-devops-remote"]
+    url = remote_srv.get("url")
+    if not url:
+        raise KeyError("Remote server configuration URL is missing from mcp_config.json")
+        
+    headers = remote_srv.get("headers", {})
+    str_headers = {k: str(v) for k, v in headers.items()}
+    
+    return url, str_headers
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """
+    App Lifespan Manager: Pre-caches remote tool definitions at startup.
+    """
+    logger.info("Initializing persistent Remote MCP Client...")
+    try:
+        remote_url, mcp_headers = get_remote_config()
+        
+        # Instantiate remote client once
+        mcp_session = RemoteMCPClient(remote_url, default_headers=mcp_headers)
+        await mcp_session.initialize()
+        
+        mcp_tools_resp = await mcp_session.list_tools()
+        
+        # Cache active session objects in app state
+        app.state.mcp_session = mcp_session
+        app.state.mcp_tools = mcp_tools_resp.tools
+        
+        logger.info(f"Persistent Remote MCP Client initialized successfully. Cached {len(app.state.mcp_tools)} tools.")
+    except Exception as err:
+        logger.critical(f"Failed to start remote MCP connection: {err}", exc_info=True)
+        sys.exit(1)
+        
+    yield
+    
+    logger.info("Shutting down persistent Remote MCP Session...")
+
+# Initialize app with lifespan manager
+app = FastAPI(title="Azure DevOps Remote Agent Server", lifespan=lifespan)
+
+# Allow CORS so our static HTML file can query the backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ChatRequest(BaseModel):
+    prompt: str = Field(..., description="The query sent by the user describing DevOps automation requests.")
+
+
+
+def determine_subagent_role(prompt: str) -> Dict[str, str]:
+    prompt_lower = prompt.lower()
+    matched_roles = []
+    
+    for role_name, config_data in SUBAGENT_ROLES.items():
+        if role_name == "General Assistant":
+            continue
+        if any(k in prompt_lower for k in config_data["keywords"]):
+            matched_roles.append({
+                "name": role_name,
+                "instruction": config_data["instruction"]
+            })
+            
+    if len(matched_roles) == 1:
+        return matched_roles[0]
+    else:
+        general = SUBAGENT_ROLES["General Assistant"]
+        return {
+            "name": "General Assistant",
+            "instruction": general["instruction"]
+        }
+
+def filter_tools_for_role(role_name: str, mcp_tools: List[Any]) -> List[types.Tool]:
+    gemini_declarations = []
+    role_config = SUBAGENT_ROLES.get(role_name, SUBAGENT_ROLES["General Assistant"])
+    allowed = role_config["prefixes"]
+    
+    for tool in mcp_tools:
+        name = tool.name
+        include = False
+        
+        for prefix in allowed:
+            if name.startswith(prefix) or name == prefix:
+                include = True
+                break
+                
+        if include:
+            schema = tool.inputSchema or {"type": "object", "properties": {}}
+            decl = types.FunctionDeclaration(
+                name=tool.name,
+                description=tool.description or f"Executes {tool.name}",
+                parameters_json_schema=schema
+            )
+            gemini_declarations.append(decl)
+            
+    return [types.Tool(function_declarations=gemini_declarations)]
+
+async def execute_agent_run(
+    prompt: str,
+    system_instruction: str,
+    tools: List[types.Tool],
+    mcp_session: RemoteMCPClient,
+    max_loops: int = 40,
+    event_handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
+) -> str:
+    gemini_client = genai.Client()
+    contents = [
+        types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+    ]
+    loop_count = 0
+    final_text = ""
+
+    while loop_count < max_loops:
+        if loop_count > 0:
+            await asyncio.sleep(4.5)
+
+        gen_config = types.GenerateContentConfig(
+            tools=tools,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            system_instruction=system_instruction
+        )
+
+        response = gemini_client.models.generate_content(
+            model=config.gemini_model,
+            contents=contents,
+            config=gen_config
+        )
+
+        thought_desc = ""
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if getattr(part, "text", None):
+                    thought_desc += part.text
+
+        if thought_desc.strip() and event_handler:
+            await event_handler({"type": "thought", "message": thought_desc.strip()})
+
+        if not response.function_calls:
+            if thought_desc.strip():
+                final_text = thought_desc.strip()
+            break
+
+        contents.append(response.candidates[0].content)
+        tool_responses = []
+
+        for call in response.function_calls:
+            logger.info(f" -> CALLING TOOL: {call.name} with args: {call.args}")
+            if event_handler:
+                await event_handler({
+                    "type": "tool_start",
+                    "tool": call.name,
+                    "arguments": call.args or {},
+                    "message": f"Invoking {call.name}"
+                })
+
+            try:
+                tool_result = await mcp_session.call_tool(call.name, call.args)
+                result_text = ""
+                if tool_result.content:
+                    result_text = "\n".join(
+                        c.text for c in tool_result.content if getattr(c, "text", None)
+                    )
+                
+                if event_handler:
+                    await event_handler({
+                        "type": "tool_complete",
+                        "tool": call.name,
+                        "status": "success",
+                        "message": f"Successfully ran {call.name}."
+                    })
+
+                truncated_result = result_text
+                if len(truncated_result) > 3000:
+                    truncated_result = truncated_result[:3000] + "\n\n... [Truncated by server to conserve Gemini API free tier token quota] ..."
+
+                tool_responses.append(
+                    types.Part.from_function_response(
+                        name=call.name,
+                        response={"result": truncated_result}
+                    )
+                )
+            except Exception as tool_err:
+                logger.error(f" [ERROR] ({call.name}): {tool_err}")
+                if event_handler:
+                    await event_handler({
+                        "type": "tool_complete",
+                        "tool": call.name,
+                        "status": "failed",
+                        "message": f"Error running {call.name}: {str(tool_err)}"
+                    })
+                tool_responses.append(
+                    types.Part.from_function_response(
+                        name=call.name,
+                        response={"error": str(tool_err)}
+                    )
+                )
+
+        contents.append(types.Content(role="tool", parts=tool_responses))
+        loop_count += 1
+
+    if loop_count >= max_loops and not final_text:
+        final_text = "Reached maximum tool execution steps without a final response."
+
+    return final_text
+
+@app.post("/api/chat/stream")
+async def chat_stream_endpoint(request: ChatRequest, req: Request) -> StreamingResponse:
+    # Pull persistent session directly from FastAPI state context
+    mcp_session = req.app.state.mcp_session
+    mcp_tools = req.app.state.mcp_tools
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            logger.info(f"Reusing persistent remote client for query: '{request.prompt[:50]}...'")
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Established connection to Azure DevOps Remote MCP server.'})}\n\n"
+
+            subagent = determine_subagent_role(request.prompt)
+            gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
+            subagent_name = subagent["name"]
+            
+            yield f"data: {json.dumps({'type': 'subagent', 'name': subagent_name})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'message': f'Active Profile: Summoned {subagent_name} to analyze your request.'})}\n\n"
+
+            queue = asyncio.Queue()
+
+            async def handle_progress(event: Dict[str, Any]) -> None:
+                await queue.put(event)
+
+            system_instruction = (
+                f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
+                "To conserve API quota, you MUST follow these constraints:\n"
+                f"1. The default project is '{config.default_project}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
+                "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
+                "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
+                "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
+                "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
+                "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
+            )
+
+            agent_task = asyncio.create_task(
+                execute_agent_run(
+                    prompt=request.prompt,
+                    system_instruction=system_instruction,
+                    tools=gemini_tools,
+                    mcp_session=mcp_session,
+                    event_handler=handle_progress
+                )
+            )
+
+            while not agent_task.done() or not queue.empty():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.1)
+                    yield f"data: {json.dumps(event)}\n\n"
+                    queue.task_done()
+                except asyncio.TimeoutError:
+                    continue
+
+            final_text = await agent_task
+            yield f"data: {json.dumps({'type': 'final', 'message': final_text})}\n\n"
+
+        except Exception as err:
+            logger.error(f"Execution failed: {err}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Error during execution: {str(err)}'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: RemoteMCPClient, mcp_tools: List[Any]) -> None:
+    logger.info(f"[Build Doctor] Commencing build diagnosis for build #{build_id} under pipeline {pipeline_id}...")
+    try:
+        prompt = (
+            f"Build #{build_id} in pipeline {pipeline_id} under project '{project_name}' has failed.\n"
+            "Your job as the Build Doctor is to:\n"
+            f"1. Query the build logs for build ID '{build_id}' (using pipelines_build_log list and get_content) "
+            "to extract the exact compiler error, syntax failure, or failing test case.\n"
+            "2. Once you find the root cause, write a detailed summary explaining the error "
+            "and outlining the exact lines of code and changes needed to fix it."
+        )
+        
+        tools = filter_tools_for_role("DevOps Engineer", mcp_tools)
+        
+        async def handle_progress(event: Dict[str, Any]) -> None:
+            if event["type"] == "thought":
+                logger.info(f"[Build Doctor thought]: {event['message']}")
+            elif event["type"] == "tool_start":
+                logger.info(f"[Build Doctor calling {event['tool']}]")
+
+        system_instruction = (
+            "You are a DevOps Engineer. Diagnose build failures autonomously by querying build logs and identifying the root cause."
+        )
+
+        final_text = await execute_agent_run(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            tools=tools,
+            mcp_session=mcp_session,
+            max_loops=10,
+            event_handler=handle_progress
+        )
+        logger.info(
+            f"\n================ BUILD DOCTOR DIAGNOSTIC REPORT ================\n"
+            f"Build ID: {build_id}\n"
+            f"Project: {project_name}\n"
+            f"Pipeline ID: {pipeline_id}\n"
+            f"Diagnosis & Recommended Fix:\n{final_text}\n"
+            f"================================================================"
+        )
+        logger.info(f"[Build Doctor] Diagnostic completed for build #{build_id}.")
+    except Exception as e:
+        logger.error(f"[Build Doctor] Error during build diagnosis: {e}", exc_info=True)
+
+@app.post("/api/webhooks/ado")
+async def azure_devops_webhook(request: Request) -> Dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    event_type = payload.get("eventType")
+    resource = payload.get("resource", {})
+    
+    logger.info(f"[Webhook Received] Event Type: {event_type}")
+    
+    if event_type == "build.complete":
+        result = resource.get("result")
+        build_id = resource.get("id")
+        project_name = resource.get("project", {}).get("name") or config.default_project
+        pipeline_id = resource.get("definition", {}).get("id")
+        
+        if result == "failed":
+            logger.info(f"[Build Doctor] Triggering auto-healing diagnostics for Build #{build_id} in project '{project_name}'...")
+            mcp_session = request.app.state.mcp_session
+            mcp_tools = request.app.state.mcp_tools
+            asyncio.create_task(run_build_doctor(str(build_id), project_name, str(pipeline_id), mcp_session, mcp_tools))
+            return {"status": "triggered_build_doctor", "build_id": build_id}
+            
+    return {"status": "ignored", "event_type": event_type}
+
+# Serve static HTML/JS frontend from the current directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+app.mount("/", StaticFiles(directory=current_dir, html=True), name="static")
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting Remote Uvicorn server on port {config.port}...")
+    uvicorn.run(app, host="127.0.0.1", port=config.port)
