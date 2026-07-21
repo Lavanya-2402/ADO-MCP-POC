@@ -1,0 +1,45 @@
+======================================================================
+REMOTE MCP TOOLS LIST (40 TOOLS)
+======================================================================
+Exposed by Remote Azure DevOps Gateway using service principal client credentials
+
+ - repo_repository : Read operations on Azure DevOps Git repositories.
+ - wiki_upsert_page : Create or update a wiki page with content.
+ - repo_pull_request_thread : Read operations on pull request comment threads.
+ - testplan_test_plan_write : Write operations on Azure DevOps test plans.
+ - testplan_test_suite_write : Write operations on Azure DevOps test suites.
+ - repo_pull_request : Read operations on Azure DevOps pull requests.
+ - core_list_projects : Retrieve a list of projects in your Azure DevOps organization.
+ - advsec_alerts : Read operations on Advanced Security alerts.
+ - repo_file : Read operations against repository tree contents.
+ - pipelines_write : Destructive pipeline operations (run, create).
+ - core_list_project_teams : Retrieve a list of teams for the specified Azure DevOps project.
+ - work_iteration_write : Write operations on Azure Boards iterations.
+ - pipelines_definition : Read operations on pipeline (build) definitions.
+ - pipelines_run : Read operations on pipeline runs.
+ - wit_work_item_write : Write operations on Azure DevOps work items.
+ - testplan_test_run_write : Write operations on Azure DevOps test runs and test points.
+ - search_wiki : Search Azure DevOps Wiki for a given search text.
+ - work : Read operations on Azure Boards iterations, team settings.
+ - repo_pull_request_write : Write operations on Azure DevOps pull requests.
+ - pipelines_build : Read operations on Azure Pipelines builds.
+ - wit_backlog : Read operations on Azure DevOps backlogs.
+ - repo_create_branch : Create a new branch in the repository.
+ - search_workitem : Get Azure DevOps Work Item search results for a given search query.
+ - pipelines_build_log : Build log access.
+ - wit_work_item_link_write : Write operations on work item links.
+ - repo_pull_request_thread_write : Write operations on pull request comment threads.
+ - repo_branch : Read operations on Git branches.
+ - work_capacity_write : Write operations on Azure Boards team capacity.
+ - testplan : Read operations on Azure DevOps test plans, suites, and cases.
+ - wiki : Read operations on Azure DevOps wikis.
+ - testplan_show_test_results_from_build_id : Gets test result details for a given project and build ID.
+ - wit_work_item_attachment : Download a work item attachment by its ID.
+ - wit_query : Read operations on Azure DevOps work item queries.
+ - testplan_test_case_write : Write operations on Azure DevOps test cases.
+ - wit_work_item : Read operations on Azure DevOps work items.
+ - wit_work_item_comment_write : Write operations on work item comments.
+ - repo_search_commits : Search for commits in a repository with comprehensive filters.
+ - testplan_test_run : Read operations on Azure DevOps test runs.
+ - search_code : Search Azure DevOps Repositories for a given search text.
+ - pipelines_artifact : List or download pipeline artifacts for a particular build.

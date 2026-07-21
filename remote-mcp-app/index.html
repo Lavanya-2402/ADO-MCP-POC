@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Azure DevOps AI Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-wrapper">
+        <!-- Floating Header -->
+        <header class="app-header">
+            <div class="header-left">
+                <div class="logo-badge">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="16 18 22 12 16 6"></polyline>
+                        <polyline points="8 6 2 12 8 18"></polyline>
+                    </svg>
+                </div>
+                <h1>Azure DevOps Assistant</h1>
+            </div>
+            <div class="header-right">
+                <div class="status-row">
+                    <div class="status-indicator">
+                        <span class="pulse-dot green"></span>
+                        <span>Remote MCP Gateway Connected</span>
+                    </div>
+                    <div class="status-indicator">
+                        <span class="pulse-dot blue"></span>
+                        <span>Gemini Model Active</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Chat Area -->
+        <main class="chat-container">
+            <div class="chat-viewport" id="chat-viewport">
+                <!-- Welcome Message -->
+                <div class="message agent-message welcome-msg">
+                    <div class="avatar">A</div>
+                    <div class="message-body">
+                        <div class="agent-badge">System Orchestrator</div>
+                        <h3>Welcome to Azure DevOps Automation</h3>
+                        <p>Ask me to query projects, create work items, link dependencies, or manage build pipelines in your workspace. What would you like to automate today?</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Input area -->
+            <footer class="input-panel">
+                <form id="chat-form" onsubmit="sendMessage(event)">
+                    <label for="file-upload" class="upload-btn" aria-label="Upload Document">
+                        <svg class="upload-icon" viewBox="0 0 24 24">
+                            <path fill="currentColor" d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-3.31 2.69-6 6-6s6 2.69 6 6v10c0 4.42-3.58 8-8 8s-8-3.58-8-8V4h2v11c0 3.31 2.69 6 6 6s6-2.69 6-6V5c0-2.21-1.79-4-4-4s-4 1.79-4 4v12.5c0 1.1.9 2 2 2s2-.9 2-2V6h2z"/>
+                        </svg>
+                    </label>
+                    <input type="file" id="file-upload" accept=".txt,.md,.json,.yml,.yaml,.py,.js" style="display: none;">
+                    <input type="text" id="prompt-input" autocomplete="off" placeholder="Type an automation command or drop a file..." required>
+                    <button type="submit" id="send-btn" aria-label="Send message">
+                        <svg class="send-icon" viewBox="0 0 24 24">
+                            <path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                        </svg>
+                    </button>
+                </form>
+            </footer>
+        </main>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
