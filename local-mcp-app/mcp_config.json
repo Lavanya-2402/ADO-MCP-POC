@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "azure-devops": {
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp", "Rapid-AI-Team", "--authentication", "envvar"],
+      "env": {}
+    }
+  }
+}
