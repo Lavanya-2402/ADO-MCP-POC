@@ -3,31 +3,25 @@ import os
 import sys
 import json
 import logging
-from typing import Dict, List, Any, AsyncGenerator, Optional
-from contextlib import asynccontextmanager, AsyncExitStack
+import argparse
+from contextlib import AsyncExitStack
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# Configure structured logging
+# Configure logging to stdout
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("azure-devops-agent-local")
+logger = logging.getLogger("azure-devops-agent-local-cli")
 
 # Load environment variables
 load_dotenv()
 
-# Configuration Validation Class
 class AppConfig:
     def __init__(self) -> None:
         self.gemini_api_key: str = self._get_required_env("GEMINI_API_KEY")
@@ -36,7 +30,6 @@ class AppConfig:
         self.default_project: str = os.getenv("AZURE_DEVOPS_PROJECT", "Pulse")
         self.default_repo: str = os.getenv("AZURE_DEVOPS_REPOSITORY", "Pulse")
         self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-        self.port: int = int(os.getenv("PORT", "8180"))
 
     def _get_required_env(self, key: str) -> str:
         val = os.getenv(key)
@@ -48,7 +41,7 @@ class AppConfig:
 try:
     config = AppConfig()
 except RuntimeError as err:
-    logger.critical(f"Server startup failed due to config errors: {err}")
+    logger.critical(f"CLI startup failed due to config errors: {err}")
     sys.exit(1)
 
 # Global subagent role mapping configurations
@@ -135,60 +128,7 @@ def get_local_stdio_params() -> StdioServerParameters:
         env=env_vars
     )
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """
-    App Lifespan Manager: Initializes a Persistent Stdio Subprocess session 
-    and list tools once at startup, caching them for sub-second route access.
-    Cleanly exits the stack on app shutdown.
-    """
-    logger.info("Initializing persistent Local MCP Session...")
-    exit_stack = AsyncExitStack()
-    try:
-        server_params = get_local_stdio_params()
-        
-        # Enter stdio client subprocess context
-        read_stream, write_stream = await exit_stack.enter_async_context(stdio_client(server_params))
-        # Enter ClientSession context
-        mcp_session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
-        
-        await mcp_session.initialize()
-        mcp_tools_resp = await mcp_session.list_tools()
-        
-        # Cache active session objects in app state
-        app.state.mcp_session = mcp_session
-        app.state.mcp_tools = mcp_tools_resp.tools
-        app.state.exit_stack = exit_stack
-        
-        logger.info(f"Persistent Local MCP Session initialized successfully. Cached {len(app.state.mcp_tools)} tools.")
-    except Exception as err:
-        logger.critical(f"Failed to start local MCP subprocess: {err}", exc_info=True)
-        await exit_stack.aclose()
-        sys.exit(1)
-        
-    yield
-    
-    logger.info("Shutting down persistent Local MCP Session...")
-    await exit_stack.aclose()
-    logger.info("Local MCP Session shutdown completed.")
-
-# Initialize app with lifespan manager
-app = FastAPI(title="Azure DevOps Agent Local Server", lifespan=lifespan)
-
-# Allow CORS for static HTML file queries
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ChatRequest(BaseModel):
-    prompt: str = Field(..., description="The query sent by the user describing DevOps automation requests.")
-
-
-def determine_subagent_role(prompt: str) -> Dict[str, str]:
+def determine_subagent_role(prompt: str) -> dict:
     prompt_lower = prompt.lower()
     matched_roles = []
 
@@ -206,8 +146,7 @@ def determine_subagent_role(prompt: str) -> Dict[str, str]:
     general = SUBAGENT_ROLES["General Assistant"]
     return {"name": "General Assistant", "instruction": general["instruction"]}
 
-
-def filter_tools_for_role(role_name: str, mcp_tools: List[Any]) -> List[types.Tool]:
+def filter_tools_for_role(role_name: str, mcp_tools: list) -> list:
     gemini_declarations = []
     role_config = SUBAGENT_ROLES.get(role_name, SUBAGENT_ROLES["General Assistant"])
     allowed = role_config["prefixes"]
@@ -223,11 +162,10 @@ def filter_tools_for_role(role_name: str, mcp_tools: List[Any]) -> List[types.To
 
     return [types.Tool(function_declarations=gemini_declarations)]
 
-
 async def execute_agent_run(
     prompt: str,
     system_instruction: str,
-    tools: List[types.Tool],
+    tools: list,
     mcp_session: ClientSession,
     max_loops: int = 40
 ) -> str:
@@ -265,18 +203,20 @@ async def execute_agent_run(
         tool_responses = []
 
         for call in response.function_calls:
-            logger.info(f" -> TOOL: {call.name} | args: {call.args}")
+            logger.info(f"TOOL CALL -> {call.name}")
+            logger.debug(f"Arguments: {json.dumps(call.args, indent=2)}")
             try:
                 tool_result = await mcp_session.call_tool(call.name, call.args)
                 result_text = "\n".join(
                     c.text for c in tool_result.content if getattr(c, "text", None)
                 ) if tool_result.content else ""
 
+                logger.debug(f"Tool result (length={len(result_text)}): {result_text[:200]}...")
                 tool_responses.append(types.Part.from_function_response(
                     name=call.name, response={"result": result_text}
                 ))
             except Exception as tool_err:
-                logger.error(f" -> TOOL ERROR ({call.name}): {tool_err}")
+                logger.error(f"Tool Error ({call.name}): {tool_err}")
                 tool_responses.append(types.Part.from_function_response(
                     name=call.name, response={"error": str(tool_err)}
                 ))
@@ -289,49 +229,7 @@ async def execute_agent_run(
 
     return final_text
 
-@app.post("/api/chat/stream")
-async def chat_stream_endpoint(request: ChatRequest, req: Request) -> StreamingResponse:
-    mcp_session = req.app.state.mcp_session
-    mcp_tools = req.app.state.mcp_tools
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            logger.info(f"Incoming query: '{request.prompt[:80]}...'")
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Connected to Azure DevOps MCP server.'})}\n\n"
-
-            subagent = determine_subagent_role(request.prompt)
-            gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
-            subagent_name = subagent["name"]
-
-            yield f"data: {json.dumps({'type': 'subagent', 'name': subagent_name})}\n\n"
-            yield f"data: {json.dumps({'type': 'status', 'message': f'Active Profile: {subagent_name}'})}\n\n"
-
-            system_instruction = (
-                f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
-                "To conserve API quota, you MUST follow these constraints:\n"
-                f"1. The default project is '{config.default_project}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
-                "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
-                "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
-                "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
-                "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
-                "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
-            )
-
-            final_text = await execute_agent_run(
-                prompt=request.prompt,
-                system_instruction=system_instruction,
-                tools=gemini_tools,
-                mcp_session=mcp_session
-            )
-            yield f"data: {json.dumps({'type': 'final', 'message': final_text})}\n\n"
-
-        except Exception as err:
-            logger.error(f"Execution failed: {err}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Error during execution: {str(err)}'})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: ClientSession, mcp_tools: List[Any]) -> None:
+async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: ClientSession, mcp_tools: list) -> None:
     logger.info(f"[Build Doctor] Starting diagnosis for build #{build_id} in pipeline {pipeline_id}...")
     try:
         prompt = (
@@ -346,49 +244,99 @@ async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, m
         system_instruction = (
             "You are a DevOps Engineer and Product Manager. Diagnose build failures and report bugs autonomously."
         )
-        await execute_agent_run(
+        final_text = await execute_agent_run(
             prompt=prompt,
             system_instruction=system_instruction,
             tools=tools,
             mcp_session=mcp_session,
             max_loops=10
         )
-        logger.info(f"[Build Doctor] Diagnostic completed for build #{build_id}.")
+        logger.info("=== BUILD DOCTOR DIAGNOSIS RESULT ===")
+        logger.info(final_text)
+        logger.info("=====================================")
     except Exception as e:
         logger.error(f"[Build Doctor] Error during build diagnosis: {e}", exc_info=True)
 
-@app.post("/api/webhooks/ado")
-async def azure_devops_webhook(request: Request) -> Dict[str, Any]:
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+async def main():
+    parser = argparse.ArgumentParser(description="Azure DevOps Agent Local Command Line Interface")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-p", "--prompt", type=str, help="Prompt describing DevOps automation requests.")
+    group.add_argument("-f", "--file", type=str, help="Path to a text file containing the prompt / tasks.")
+    
+    # Build Doctor options
+    parser.add_argument("--build-doctor", action="store_true", help="Trigger Build Doctor diagnosis directly.")
+    parser.add_argument("--build-id", type=str, help="Build ID to diagnose (required for Build Doctor).")
+    parser.add_argument("--project", type=str, help="Project name (defaults to env config).")
+    parser.add_argument("--pipeline", type=str, help="Pipeline ID (required for Build Doctor).")
+    
+    args = parser.parse_args()
 
-    event_type = payload.get("eventType")
-    resource = payload.get("resource", {})
-    
-    logger.info(f"[Webhook Received] Event Type: {event_type}")
-    
-    if event_type == "build.complete":
-        result = resource.get("result")
-        build_id = resource.get("id")
-        project_name = resource.get("project", {}).get("name") or config.default_project
-        pipeline_id = resource.get("definition", {}).get("id")
-        
-        if result == "failed":
-            logger.info(f"[Build Doctor] Triggering auto-healing diagnostics for Build #{build_id} in project '{project_name}'...")
-            mcp_session = request.app.state.mcp_session
-            mcp_tools = request.app.state.mcp_tools
-            asyncio.create_task(run_build_doctor(str(build_id), project_name, str(pipeline_id), mcp_session, mcp_tools))
-            return {"status": "triggered_build_doctor", "build_id": build_id}
+    # Determine standard prompt/task content
+    prompt_content = ""
+    if args.prompt:
+        prompt_content = args.prompt
+    elif args.file:
+        if not os.path.exists(args.file):
+            logger.error(f"File '{args.file}' not found.")
+            sys.exit(1)
+        with open(args.file, "r", encoding="utf-8") as f:
+            prompt_content = f.read().strip()
             
-    return {"status": "ignored", "event_type": event_type}
+    if not prompt_content and not args.build_doctor:
+        logger.error("Empty prompt or file content.")
+        sys.exit(1)
 
-# Serve static HTML/JS frontend from the current directory
-current_dir = os.path.dirname(os.path.abspath(__file__))
-app.mount("/", StaticFiles(directory=current_dir, html=True), name="static")
+    logger.info("Initializing persistent Local MCP Session via CLI...")
+    exit_stack = AsyncExitStack()
+    try:
+        server_params = get_local_stdio_params()
+        read_stream, write_stream = await exit_stack.enter_async_context(stdio_client(server_params))
+        mcp_session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
+        await mcp_session.initialize()
+        mcp_tools_resp = await mcp_session.list_tools()
+        mcp_tools = mcp_tools_resp.tools
+        logger.info(f"Persistent Session initialized. Loaded {len(mcp_tools)} tools.\n")
+        
+        if args.build_doctor:
+            if not args.build_id or not args.pipeline:
+                logger.error("--build-id and --pipeline are required when using --build-doctor.")
+                sys.exit(1)
+            project_name = args.project or config.default_project
+            await run_build_doctor(args.build_id, project_name, args.pipeline, mcp_session, mcp_tools)
+        else:
+            subagent = determine_subagent_role(prompt_content)
+            gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
+            subagent_name = subagent["name"]
+            
+            logger.info(f"Active Profile: {subagent_name}")
+            system_instruction = (
+                f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
+                "To conserve API quota, you MUST follow these constraints:\n"
+                f"1. The default project is '{config.default_project}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
+                "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
+                "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
+                "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
+                "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
+                "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
+            )
+            
+            logger.info("Running agent task...")
+            final_text = await execute_agent_run(
+                prompt=prompt_content,
+                system_instruction=system_instruction,
+                tools=gemini_tools,
+                mcp_session=mcp_session
+            )
+            
+            logger.info("=== FINAL AGENT RESPONSE ===")
+            logger.info(final_text)
+            logger.info("============================")
+            
+    except Exception as err:
+        logger.critical(f"CLI execution failed: {err}", exc_info=True)
+    finally:
+        await exit_stack.aclose()
+        logger.info("MCP Stdio Session closed.")
 
 if __name__ == "__main__":
-    import uvicorn
-    logger.info(f"Starting Local Uvicorn server on port {config.port}...")
-    uvicorn.run(app, host="127.0.0.1", port=config.port)
+    asyncio.run(main())

@@ -1,58 +1,7 @@
-// Simple Markdown Parser for beautiful chat presentation
+// Markdown Parser using marked.js (https://marked.js.org)
 function parseMarkdown(text) {
     if (!text) return '';
-    
-    let html = text;
-    
-    // Escape HTML special chars to prevent script injection but preserve basic markup later
-    html = html
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-        
-    // Code blocks: ```code```
-    html = html.replace(/```([\s\S]+?)```/g, (match, code) => {
-        return `<pre><code>${code.trim()}</code></pre>`;
-    });
-    
-    // Inline code: `code`
-    html = html.replace(/`([^`\n]+?)`/g, '<code>$1</code>');
-    
-    // Bold text: **text**
-    html = html.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>');
-    
-    // Markdown Links: [text](url)
-    html = html.replace(/\[([^\]]+?)\]\(([^)]+?)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-    
-    // Unordered lists: lines starting with * or -
-    const lines = html.split('\n');
-    let inList = false;
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (line.startsWith('* ') || line.startsWith('- ')) {
-            const content = line.substring(2);
-            if (!inList) {
-                lines[i] = '<ul><li>' + content + '</li>';
-                inList = true;
-            } else {
-                lines[i] = '<li>' + content + '</li>';
-            }
-        } else {
-            if (inList) {
-                lines[i] = '</ul>' + lines[i];
-                inList = false;
-            }
-        }
-    }
-    if (inList) {
-        lines[lines.length - 1] += '</ul>';
-    }
-    html = lines.join('\n');
-    
-    // Line breaks
-    html = html.replace(/\n/g, '<br>');
-    
-    return html;
+    return marked.parse(text);
 }
 
 // Send Message Handler

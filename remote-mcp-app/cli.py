@@ -4,32 +4,26 @@ import sys
 import json
 import time
 import logging
+import argparse
 from dataclasses import dataclass
-from typing import Dict, List, Any, AsyncGenerator, Optional, Tuple
-from contextlib import asynccontextmanager
+from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
 import msal
 import httpx
 from google import genai
 from google.genai import types
 
-# Configure structured logging
+# Configure logging to stdout
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("azure-devops-agent-remote")
+logger = logging.getLogger("azure-devops-agent-remote-cli")
 
 # Load environment variables
 load_dotenv()
 
-# Configuration Validation Class
 class AppConfig:
     def __init__(self) -> None:
         self.gemini_api_key: str = self._get_required_env("GEMINI_API_KEY")
@@ -37,9 +31,8 @@ class AppConfig:
         self.default_project: str = os.getenv("AZURE_DEVOPS_PROJECT", "Pulse")
         self.default_repo: str = os.getenv("AZURE_DEVOPS_REPOSITORY", "Pulse")
         self.gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-        self.port: int = int(os.getenv("PORT", "8199"))
-        # Fix 12: Validate Entra credentials at startup so the server fails fast
-        # rather than crashing mid-request when the first API call is made.
+        # Fix 12: Validate Entra credentials at startup so CLI fails fast
+        # rather than crashing mid-run on the first API call.
         self.entra_tenant_id: str = self._get_required_env("ENTRA_TENANT_ID")
         self.entra_client_id: str = self._get_required_env("ENTRA_CLIENT_ID")
         self.entra_client_secret: str = self._get_required_env("ENTRA_CLIENT_SECRET")
@@ -54,9 +47,8 @@ class AppConfig:
 try:
     config = AppConfig()
 except RuntimeError as err:
-    logger.critical(f"Server startup failed due to config errors: {err}")
+    logger.critical(f"CLI startup failed due to config errors: {err}")
     sys.exit(1)
-
 
 @dataclass
 class Tool:
@@ -77,33 +69,22 @@ class CallToolResponse:
     content: List[Content]
 
 # Fix 13: Use msal.SerializableTokenCache + asyncio.Lock instead of a plain
-# global dict. The lock prevents concurrent requests from triggering duplicate
-# token fetches when the cache is cold or the token has just expired.
+# global dict to prevent concurrent duplicate token fetches.
 _msal_token_cache = msal.SerializableTokenCache()
 _token_lock = asyncio.Lock()
 _token_expiry: float = 0.0
 
 def format_auth_header(token: str) -> str:
-    """
-    Formats the token correctly as a Bearer token.
-    """
     token_str = token.strip()
     if token_str.startswith("Bearer "):
         return token_str
     return f"Bearer {token_str}"
 
 async def get_auth_token() -> str:
-    """
-    Acquires an authentication token for Azure DevOps using MSAL Client Credentials Flow.
-    Credentials are read from AppConfig (validated at startup). Token is cached in
-    msal.SerializableTokenCache and refreshed under an asyncio.Lock to prevent
-    concurrent duplicate token fetches.
-    """
     global _token_expiry
     current_time = time.time()
 
     async with _token_lock:
-        # Return cached token if still valid (with 60s buffer)
         cached = _msal_token_cache.find(msal.TokenCache.CredentialType.ACCESS_TOKEN)
         if cached and current_time < _token_expiry - 60:
             return cached[0]["secret"]
@@ -130,27 +111,20 @@ async def get_auth_token() -> str:
             return result["access_token"]
         except Exception as e:
             logger.error(f"[MSAL ERROR] Failed to fetch token: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"OAuth Token Acquisition failed: {str(e)}")
-
+            raise RuntimeError(f"OAuth Token Acquisition failed: {str(e)}")
 
 class RemoteMCPClient:
-    """
-    Client class that implements JSON-RPC communication over HTTPS
-    with dynamic OAuth Bearer token injection and error handling.
-    """
     def __init__(self, remote_url: str, token: Optional[str] = None, default_headers: Optional[Dict[str, str]] = None) -> None:
         if not remote_url.startswith("http"):
             self.url = f"https://mcp.dev.azure.com/{remote_url}"
         else:
             self.url = remote_url
-
         self.token = token
         self.default_headers = default_headers or {}
 
     async def get_headers(self) -> Dict[str, str]:
         token = self.token or await get_auth_token()
         auth_header = format_auth_header(token)
-            
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
@@ -171,7 +145,7 @@ class RemoteMCPClient:
             response = await client.post(self.url, json=payload, headers=headers, timeout=60.0)
             if response.status_code != 200:
                 logger.error(f"Failed to list tools from remote server: HTTP {response.status_code}")
-                raise HTTPException(status_code=response.status_code, detail=f"Remote server error: {response.text}")
+                raise RuntimeError(f"Remote server error: {response.text}")
             
             data = response.text.strip()
             if data.startswith("event:"):
@@ -187,7 +161,6 @@ class RemoteMCPClient:
             tools_list = []
             for t in res_json.get("result", {}).get("tools", []):
                 tools_list.append(Tool(t.get("name", ""), t.get("description", ""), t.get("inputSchema", {})))
-            
             return ToolsResponse(tools_list)
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> CallToolResponse:
@@ -204,8 +177,8 @@ class RemoteMCPClient:
         async with httpx.AsyncClient() as client:
             response = await client.post(self.url, json=payload, headers=headers, timeout=60.0)
             if response.status_code != 200:
-                logger.error(f"Failed to execute tool '{name}': HTTP {response.status_code}")
-                raise HTTPException(status_code=response.status_code, detail=f"Remote execution error: {response.text}")
+                logger.error(f"Failed to call tool '{name}' on remote server: HTTP {response.status_code}")
+                raise RuntimeError(f"Remote server call_tool failed: {response.text}")
             
             data = response.text.strip()
             if data.startswith("event:"):
@@ -216,15 +189,13 @@ class RemoteMCPClient:
             
             res_json = json.loads(data)
             if "error" in res_json:
-                raise RuntimeError(f"RPC Error: {res_json['error']}")
+                raise RuntimeError(f"RPC Error on call_tool '{name}': {res_json['error']}")
             
-            contents = []
-            for item in res_json.get("result", {}).get("content", []):
-                contents.append(Content(item.get("text", "")))
-            
-            return CallToolResponse(contents)
+            content_list = []
+            for c in res_json.get("result", {}).get("content", []):
+                content_list.append(Content(c.get("text", "")))
+            return CallToolResponse(content_list)
 
-# Global subagent role mapping configurations
 SUBAGENT_ROLES = {
     "DevOps Engineer": {
         "keywords": ["pipeline", "build", "run", "deploy", "release", "migration"],
@@ -278,75 +249,7 @@ SUBAGENT_ROLES = {
     }
 }
 
-def get_remote_config() -> Tuple[str, Dict[str, str]]:
-    local_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(local_dir, "mcp_config.json")
-    
-    if not os.path.exists(config_path):
-        logger.error(f"Local mcp_config.json configuration file not found at {config_path}")
-        raise FileNotFoundError(f"Configuration file 'mcp_config.json' not found locally in {local_dir}")
-        
-    with open(config_path, "r", encoding="utf-8") as f:
-        mcp_data = json.load(f)
-        
-    servers = mcp_data.get("mcpServers", {})
-    if "azure-devops-remote" not in servers:
-        logger.error("Configuration block 'azure-devops-remote' is missing from local mcp_config.json")
-        raise KeyError("Invalid config: 'azure-devops-remote' block is required in mcp_config.json")
-        
-    remote_srv = servers["azure-devops-remote"]
-    url = remote_srv.get("url")
-    if not url:
-        raise KeyError("Remote server configuration URL is missing from mcp_config.json")
-        
-    headers = remote_srv.get("headers", {})
-    str_headers = {k: str(v) for k, v in headers.items()}
-    
-    return url, str_headers
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """
-    App Lifespan Manager: Pre-caches remote tool definitions at startup.
-    """
-    logger.info("Initializing persistent Remote MCP Client...")
-    try:
-        remote_url, mcp_headers = get_remote_config()
-        
-        # Instantiate remote client once and fetch all tool definitions
-        mcp_session = RemoteMCPClient(remote_url, default_headers=mcp_headers)
-        mcp_tools_resp = await mcp_session.list_tools()
-        
-        # Cache active session objects in app state
-        app.state.mcp_session = mcp_session
-        app.state.mcp_tools = mcp_tools_resp.tools
-        
-        logger.info(f"Persistent Remote MCP Client initialized successfully. Cached {len(app.state.mcp_tools)} tools.")
-    except Exception as err:
-        logger.critical(f"Failed to start remote MCP connection: {err}", exc_info=True)
-        sys.exit(1)
-        
-    yield
-    
-    logger.info("Shutting down persistent Remote MCP Session...")
-
-# Initialize app with lifespan manager
-app = FastAPI(title="Azure DevOps Remote Agent Server", lifespan=lifespan)
-
-# Allow CORS so our static HTML file can query the backend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ChatRequest(BaseModel):
-    prompt: str = Field(..., description="The query sent by the user describing DevOps automation requests.")
-
-
-def determine_subagent_role(prompt: str) -> Dict[str, str]:
+def determine_subagent_role(prompt: str) -> dict:
     prompt_lower = prompt.lower()
     matched_roles = []
 
@@ -364,8 +267,7 @@ def determine_subagent_role(prompt: str) -> Dict[str, str]:
     general = SUBAGENT_ROLES["General Assistant"]
     return {"name": "General Assistant", "instruction": general["instruction"]}
 
-
-def filter_tools_for_role(role_name: str, mcp_tools: List[Any]) -> List[types.Tool]:
+def filter_tools_for_role(role_name: str, mcp_tools: list) -> list:
     gemini_declarations = []
     role_config = SUBAGENT_ROLES.get(role_name, SUBAGENT_ROLES["General Assistant"])
     allowed = role_config["prefixes"]
@@ -384,7 +286,7 @@ def filter_tools_for_role(role_name: str, mcp_tools: List[Any]) -> List[types.To
 async def execute_agent_run(
     prompt: str,
     system_instruction: str,
-    tools: List[types.Tool],
+    tools: list,
     mcp_session: RemoteMCPClient,
     max_loops: int = 40
 ) -> str:
@@ -422,18 +324,20 @@ async def execute_agent_run(
         tool_responses = []
 
         for call in response.function_calls:
-            logger.info(f" -> TOOL: {call.name} | args: {call.args}")
+            logger.info(f"TOOL CALL -> {call.name}")
+            logger.debug(f"Arguments: {json.dumps(call.args, indent=2)}")
             try:
                 tool_result = await mcp_session.call_tool(call.name, call.args)
                 result_text = "\n".join(
                     c.text for c in tool_result.content if getattr(c, "text", None)
                 ) if tool_result.content else ""
 
+                logger.debug(f"Tool result (length={len(result_text)}): {result_text[:200]}...")
                 tool_responses.append(types.Part.from_function_response(
                     name=call.name, response={"result": result_text}
                 ))
             except Exception as tool_err:
-                logger.error(f" -> TOOL ERROR ({call.name}): {tool_err}")
+                logger.error(f"Tool Error ({call.name}): {tool_err}")
                 tool_responses.append(types.Part.from_function_response(
                     name=call.name, response={"error": str(tool_err)}
                 ))
@@ -446,49 +350,7 @@ async def execute_agent_run(
 
     return final_text
 
-@app.post("/api/chat/stream")
-async def chat_stream_endpoint(request: ChatRequest, req: Request) -> StreamingResponse:
-    mcp_session = req.app.state.mcp_session
-    mcp_tools = req.app.state.mcp_tools
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            logger.info(f"Incoming query: '{request.prompt[:80]}...'")
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Connected to Azure DevOps Remote MCP server.'})}\n\n"
-
-            subagent = determine_subagent_role(request.prompt)
-            gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
-            subagent_name = subagent["name"]
-
-            yield f"data: {json.dumps({'type': 'subagent', 'name': subagent_name})}\n\n"
-            yield f"data: {json.dumps({'type': 'status', 'message': f'Active Profile: {subagent_name}'})}\n\n"
-
-            system_instruction = (
-                f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
-                "To conserve API quota, you MUST follow these constraints:\n"
-                f"1. The default project is '{config.default_project}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
-                "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
-                "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
-                "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
-                "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
-                "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
-            )
-
-            final_text = await execute_agent_run(
-                prompt=request.prompt,
-                system_instruction=system_instruction,
-                tools=gemini_tools,
-                mcp_session=mcp_session
-            )
-            yield f"data: {json.dumps({'type': 'final', 'message': final_text})}\n\n"
-
-        except Exception as err:
-            logger.error(f"Execution failed: {err}", exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Error during execution: {str(err)}'})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: RemoteMCPClient, mcp_tools: List[Any]) -> None:
+async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: RemoteMCPClient, mcp_tools: list) -> None:
     logger.info(f"[Build Doctor] Starting diagnosis for build #{build_id} in pipeline {pipeline_id}...")
     try:
         prompt = (
@@ -510,48 +372,110 @@ async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, m
             mcp_session=mcp_session,
             max_loops=10
         )
-        logger.info(
-            f"\n================ BUILD DOCTOR REPORT ================\n"
-            f"Build ID: {build_id} | Project: {project_name} | Pipeline: {pipeline_id}\n"
-            f"{final_text}\n"
-            f"====================================================="
-        )
-        logger.info(f"[Build Doctor] Diagnostic completed for build #{build_id}.")
+        logger.info("=== BUILD DOCTOR DIAGNOSIS REPORT ===")
+        logger.info(final_text)
+        logger.info("=====================================")
     except Exception as e:
         logger.error(f"[Build Doctor] Error during build diagnosis: {e}", exc_info=True)
 
-@app.post("/api/webhooks/ado")
-async def azure_devops_webhook(request: Request) -> Dict[str, Any]:
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    event_type = payload.get("eventType")
-    resource = payload.get("resource", {})
+def get_remote_mcp_config() -> str:
+    local_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(local_dir, "mcp_config.json")
     
-    logger.info(f"[Webhook Received] Event Type: {event_type}")
-    
-    if event_type == "build.complete":
-        result = resource.get("result")
-        build_id = resource.get("id")
-        project_name = resource.get("project", {}).get("name") or config.default_project
-        pipeline_id = resource.get("definition", {}).get("id")
+    if not os.path.exists(config_path):
+        logger.error(f"Remote mcp_config.json configuration file not found at {config_path}")
+        raise FileNotFoundError(f"Configuration file 'mcp_config.json' not found at {local_dir}")
         
-        if result == "failed":
-            logger.info(f"[Build Doctor] Triggering auto-healing diagnostics for Build #{build_id} in project '{project_name}'...")
-            mcp_session = request.app.state.mcp_session
-            mcp_tools = request.app.state.mcp_tools
-            asyncio.create_task(run_build_doctor(str(build_id), project_name, str(pipeline_id), mcp_session, mcp_tools))
-            return {"status": "triggered_build_doctor", "build_id": build_id}
-            
-    return {"status": "ignored", "event_type": event_type}
+    with open(config_path, "r", encoding="utf-8") as f:
+        mcp_data = json.load(f)
+        
+    servers = mcp_data.get("mcpServers", {})
+    if "azure-devops" not in servers:
+        logger.error("Configuration block 'azure-devops' is missing from remote mcp_config.json")
+        raise KeyError("Invalid config: 'azure-devops' server block is required in mcp_config.json")
+        
+    server_info = servers["azure-devops"]
+    url = server_info.get("url")
+    if not url:
+        raise KeyError("Invalid config: 'url' must be specified in the azure-devops block of mcp_config.json")
+    return url
 
-# Serve static HTML/JS frontend from the current directory
-current_dir = os.path.dirname(os.path.abspath(__file__))
-app.mount("/", StaticFiles(directory=current_dir, html=True), name="static")
+async def main():
+    parser = argparse.ArgumentParser(description="Azure DevOps Agent Remote Command Line Interface")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-p", "--prompt", type=str, help="Prompt describing DevOps automation requests.")
+    group.add_argument("-f", "--file", type=str, help="Path to a text file containing the prompt / tasks.")
+    
+    # Build Doctor options
+    parser.add_argument("--build-doctor", action="store_true", help="Trigger Build Doctor diagnosis directly.")
+    parser.add_argument("--build-id", type=str, help="Build ID to diagnose (required for Build Doctor).")
+    parser.add_argument("--project", type=str, help="Project name (defaults to env config).")
+    parser.add_argument("--pipeline", type=str, help="Pipeline ID (required for Build Doctor).")
+    
+    args = parser.parse_args()
+
+    prompt_content = ""
+    if args.prompt:
+        prompt_content = args.prompt
+    elif args.file:
+        if not os.path.exists(args.file):
+            logger.error(f"File '{args.file}' not found.")
+            sys.exit(1)
+        with open(args.file, "r", encoding="utf-8") as f:
+            prompt_content = f.read().strip()
+            
+    if not prompt_content and not args.build_doctor:
+        logger.error("Empty prompt or file content.")
+        sys.exit(1)
+
+    logger.info("Initializing Remote MCP Session via CLI...")
+    try:
+        remote_url = get_remote_mcp_config()
+        # Initialize token (this will authenticate using client credentials or cached tokens)
+        token = await get_auth_token()
+        mcp_session = RemoteMCPClient(remote_url=remote_url, token=token)
+        
+        mcp_tools_resp = await mcp_session.list_tools()
+        mcp_tools = mcp_tools_resp.tools
+        logger.info(f"Remote Session initialized. Loaded {len(mcp_tools)} tools.\n")
+        
+        if args.build_doctor:
+            if not args.build_id or not args.pipeline:
+                logger.error("--build-id and --pipeline are required when using --build-doctor.")
+                sys.exit(1)
+            project_name = args.project or config.default_project
+            await run_build_doctor(args.build_id, project_name, args.pipeline, mcp_session, mcp_tools)
+        else:
+            subagent = determine_subagent_role(prompt_content)
+            gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
+            subagent_name = subagent["name"]
+            
+            logger.info(f"Active Profile: {subagent_name}")
+            system_instruction = (
+                f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
+                "To conserve API quota, you MUST follow these constraints:\n"
+                f"1. The default project is '{config.azure_devops_organization}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
+                "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
+                "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
+                "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
+                "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
+                "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
+            )
+            
+            logger.info("Running remote agent task...")
+            final_text = await execute_agent_run(
+                prompt=prompt_content,
+                system_instruction=system_instruction,
+                tools=gemini_tools,
+                mcp_session=mcp_session
+            )
+            
+            logger.info("=== FINAL AGENT RESPONSE ===")
+            logger.info(final_text)
+            logger.info("============================")
+            
+    except Exception as err:
+        logger.critical(f"CLI execution failed: {err}", exc_info=True)
 
 if __name__ == "__main__":
-    import uvicorn
-    logger.info(f"Starting Remote Uvicorn server on port {config.port}...")
-    uvicorn.run(app, host="127.0.0.1", port=config.port)
+    asyncio.run(main())
