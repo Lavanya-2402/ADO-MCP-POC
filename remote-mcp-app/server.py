@@ -488,64 +488,7 @@ async def chat_stream_endpoint(request: ChatRequest, req: Request) -> StreamingR
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: RemoteMCPClient, mcp_tools: List[Any]) -> None:
-    logger.info(f"[Build Doctor] Starting diagnosis for build #{build_id} in pipeline {pipeline_id}...")
-    try:
-        prompt = (
-            f"Build #{build_id} in pipeline {pipeline_id} under project '{project_name}' has failed.\n"
-            "Your job as the Build Doctor is to:\n"
-            f"1. Query the build logs for build ID '{build_id}' (using pipelines_build_log list and get_content) "
-            "to extract the exact compiler error, syntax failure, or failing test case.\n"
-            "2. Once you find the root cause, write a detailed summary explaining the error "
-            "and outlining the exact lines of code and changes needed to fix it."
-        )
-        tools = filter_tools_for_role("DevOps Engineer", mcp_tools)
-        system_instruction = (
-            "You are a DevOps Engineer. Diagnose build failures autonomously by querying build logs and identifying the root cause."
-        )
-        final_text = await execute_agent_run(
-            prompt=prompt,
-            system_instruction=system_instruction,
-            tools=tools,
-            mcp_session=mcp_session,
-            max_loops=10
-        )
-        logger.info(
-            f"\n================ BUILD DOCTOR REPORT ================\n"
-            f"Build ID: {build_id} | Project: {project_name} | Pipeline: {pipeline_id}\n"
-            f"{final_text}\n"
-            f"====================================================="
-        )
-        logger.info(f"[Build Doctor] Diagnostic completed for build #{build_id}.")
-    except Exception as e:
-        logger.error(f"[Build Doctor] Error during build diagnosis: {e}", exc_info=True)
 
-@app.post("/api/webhooks/ado")
-async def azure_devops_webhook(request: Request) -> Dict[str, Any]:
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    event_type = payload.get("eventType")
-    resource = payload.get("resource", {})
-    
-    logger.info(f"[Webhook Received] Event Type: {event_type}")
-    
-    if event_type == "build.complete":
-        result = resource.get("result")
-        build_id = resource.get("id")
-        project_name = resource.get("project", {}).get("name") or config.default_project
-        pipeline_id = resource.get("definition", {}).get("id")
-        
-        if result == "failed":
-            logger.info(f"[Build Doctor] Triggering auto-healing diagnostics for Build #{build_id} in project '{project_name}'...")
-            mcp_session = request.app.state.mcp_session
-            mcp_tools = request.app.state.mcp_tools
-            asyncio.create_task(run_build_doctor(str(build_id), project_name, str(pipeline_id), mcp_session, mcp_tools))
-            return {"status": "triggered_build_doctor", "build_id": build_id}
-            
-    return {"status": "ignored", "event_type": event_type}
 
 # Serve static HTML/JS frontend from the current directory
 current_dir = os.path.dirname(os.path.abspath(__file__))

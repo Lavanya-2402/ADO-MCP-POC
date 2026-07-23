@@ -625,88 +625,20 @@ This document provides a line-by-line explanation of [server.py](file:///c:/User
 
 ---
 
-## 13. Build Doctor & Azure DevOps Webhook (Lines 491–549)
+## 13. Static File Hosting & Server Entry Point (Lines 491–498)
 
 ```python
-491: async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: RemoteMCPClient, mcp_tools: List[Any]) -> None:
-492:     logger.info(f"[Build Doctor] Starting diagnosis for build #{build_id} in pipeline {pipeline_id}...")
-493:     try:
-494:         prompt = (
-495:             f"Build #{build_id} in pipeline {pipeline_id} under project '{project_name}' has failed.\n"
-496:             "Your job as the Build Doctor is to:\n"
-497:             f"1. Query the build logs for build ID '{build_id}' (using pipelines_build_log list and get_content) "
-498:             "to extract the exact compiler error, syntax failure, or failing test case.\n"
-499:             "2. Once you find the root cause, write a detailed summary explaining the error "
-500:             "and outlining the exact lines of code and changes needed to fix it."
-501:         )
-502:         tools = filter_tools_for_role("DevOps Engineer", mcp_tools)
-503:         system_instruction = (
-504:             "You are a DevOps Engineer. Diagnose build failures autonomously by querying build logs and identifying the root cause."
-505:         )
-506:         final_text = await execute_agent_run(
-507:             prompt=prompt,
-508:             system_instruction=system_instruction,
-509:             tools=tools,
-510:             mcp_session=mcp_session,
-511:             max_loops=10
-512:         )
-513:         logger.info(
-514:             f"\n================ BUILD DOCTOR REPORT ================\n"
-515:             f"Build ID: {build_id} | Project: {project_name} | Pipeline: {pipeline_id}\n"
-516:             f"{final_text}\n"
-517:             f"====================================================="
-518:         )
-519:         logger.info(f"[Build Doctor] Diagnostic completed for build #{build_id}.")
-520:     except Exception as e:
-521:         logger.error(f"[Build Doctor] Error during build diagnosis: {e}", exc_info=True)
-522: 
-523: @app.post("/api/webhooks/ado")
-524: async def azure_devops_webhook(request: Request) -> Dict[str, Any]:
-525:     try:
-526:         payload = await request.json()
-527:     except Exception:
-528:         raise HTTPException(status_code=400, detail="Invalid JSON payload")
-529: 
-530:     event_type = payload.get("eventType")
-531:     resource = payload.get("resource", {})
-532:     
-533:     logger.info(f"[Webhook Received] Event Type: {event_type}")
-534:     
-535:     if event_type == "build.complete":
-536:         result = resource.get("result")
-537:         build_id = resource.get("id")
-538:         project_name = resource.get("project", {}).get("name") or config.default_project
-539:         pipeline_id = resource.get("definition", {}).get("id")
-540:         
-541:         if result == "failed":
-542:             logger.info(f"[Build Doctor] Triggering auto-healing diagnostics for Build #{build_id} in project '{project_name}'...")
-543:             mcp_session = request.app.state.mcp_session
-544:             mcp_tools = request.app.state.mcp_tools
-545:             asyncio.create_task(run_build_doctor(str(build_id), project_name, str(pipeline_id), mcp_session, mcp_tools))
-546:             return {"status": "triggered_build_doctor", "build_id": build_id}
-547:             
-548:     return {"status": "ignored", "event_type": event_type}
+491: # Serve static HTML/JS frontend from the current directory
+492: current_dir = os.path.dirname(os.path.abspath(__file__))
+493: app.mount("/", StaticFiles(directory=current_dir, html=True), name="static")
+494: 
+495: if __name__ == "__main__":
+496:     import uvicorn
+497:     logger.info(f"Starting Remote Uvicorn server on port {config.port}...")
+498:     uvicorn.run(app, host="127.0.0.1", port=config.port)
 ```
 
 ### Explanation & Rationale
-* **`azure_devops_webhook` (Lines 523–548):** Listens for incoming Azure DevOps service hook webhooks (`eventType == "build.complete"`). If a build fails (`result == "failed"`), it launches `run_build_doctor` as a background task using `asyncio.create_task()`.
-* **`run_build_doctor` (Lines 491–522):** Uses the `DevOps Engineer` subagent profile to inspect build logs, extract compiler or runtime errors, and generate diagnostic summaries.
+* **`app.mount("/", ...)` (Lines 491–493):** Serves static web frontend files (`index.html`, `script.js`, `styles.css`) directly from the server directory.
+* **`uvicorn.run(...)` (Lines 495–498):** Starts the Uvicorn ASGI web server on `127.0.0.1` at the configured port (default `8199`).
 
----
-
-## 14. Static File Hosting & Server Entry Point (Lines 550–557)
-
-```python
-550: # Serve static HTML/JS frontend from the current directory
-551: current_dir = os.path.dirname(os.path.abspath(__file__))
-552: app.mount("/", StaticFiles(directory=current_dir, html=True), name="static")
-553: 
-554: if __name__ == "__main__":
-555:     import uvicorn
-556:     logger.info(f"Starting Remote Uvicorn server on port {config.port}...")
-557:     uvicorn.run(app, host="127.0.0.1", port=config.port)
-```
-
-### Explanation & Rationale
-* **`app.mount("/", ...)` (Lines 551–552):** Serves static web frontend files (`index.html`, `script.js`, `styles.css`) directly from the server directory.
-* **`uvicorn.run(...)` (Lines 554–557):** Starts the Uvicorn ASGI web server on `127.0.0.1` at the configured port (default `8199`).

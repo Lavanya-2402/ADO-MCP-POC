@@ -348,36 +348,6 @@ async def execute_agent_run(
     if loop_count >= max_loops and not final_text:
         final_text = "Reached maximum tool execution steps without a final response."
 
-    return final_text
-
-async def run_build_doctor(build_id: str, project_name: str, pipeline_id: str, mcp_session: RemoteMCPClient, mcp_tools: list) -> None:
-    logger.info(f"[Build Doctor] Starting diagnosis for build #{build_id} in pipeline {pipeline_id}...")
-    try:
-        prompt = (
-            f"Build #{build_id} in pipeline {pipeline_id} under project '{project_name}' has failed.\n"
-            "Your job as the Build Doctor is to:\n"
-            f"1. Query the build logs for build ID '{build_id}' (using pipelines_build_log list and get_content) "
-            "to extract the exact compiler error, syntax failure, or failing test case.\n"
-            "2. Once you find the root cause, write a detailed summary explaining the error "
-            "and outlining the exact lines of code and changes needed to fix it."
-        )
-        tools = filter_tools_for_role("DevOps Engineer", mcp_tools)
-        system_instruction = (
-            "You are a DevOps Engineer. Diagnose build failures autonomously by querying build logs and identifying the root cause."
-        )
-        final_text = await execute_agent_run(
-            prompt=prompt,
-            system_instruction=system_instruction,
-            tools=tools,
-            mcp_session=mcp_session,
-            max_loops=10
-        )
-        logger.info("=== BUILD DOCTOR DIAGNOSIS REPORT ===")
-        logger.info(final_text)
-        logger.info("=====================================")
-    except Exception as e:
-        logger.error(f"[Build Doctor] Error during build diagnosis: {e}", exc_info=True)
-
 def get_remote_mcp_config() -> str:
     local_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(local_dir, "mcp_config.json")
@@ -406,12 +376,6 @@ async def main():
     group.add_argument("-p", "--prompt", type=str, help="Prompt describing DevOps automation requests.")
     group.add_argument("-f", "--file", type=str, help="Path to a text file containing the prompt / tasks.")
     
-    # Build Doctor options
-    parser.add_argument("--build-doctor", action="store_true", help="Trigger Build Doctor diagnosis directly.")
-    parser.add_argument("--build-id", type=str, help="Build ID to diagnose (required for Build Doctor).")
-    parser.add_argument("--project", type=str, help="Project name (defaults to env config).")
-    parser.add_argument("--pipeline", type=str, help="Pipeline ID (required for Build Doctor).")
-    
     args = parser.parse_args()
 
     prompt_content = ""
@@ -424,7 +388,7 @@ async def main():
         with open(args.file, "r", encoding="utf-8") as f:
             prompt_content = f.read().strip()
             
-    if not prompt_content and not args.build_doctor:
+    if not prompt_content:
         logger.error("Empty prompt or file content.")
         sys.exit(1)
 
@@ -439,41 +403,34 @@ async def main():
         mcp_tools = mcp_tools_resp.tools
         logger.info(f"Remote Session initialized. Loaded {len(mcp_tools)} tools.\n")
         
-        if args.build_doctor:
-            if not args.build_id or not args.pipeline:
-                logger.error("--build-id and --pipeline are required when using --build-doctor.")
-                sys.exit(1)
-            project_name = args.project or config.default_project
-            await run_build_doctor(args.build_id, project_name, args.pipeline, mcp_session, mcp_tools)
-        else:
-            subagent = determine_subagent_role(prompt_content)
-            gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
-            subagent_name = subagent["name"]
-            
-            logger.info(f"Active Profile: {subagent_name}")
-            system_instruction = (
-                f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
-                "To conserve API quota, you MUST follow these constraints:\n"
-                f"1. The default project is '{config.azure_devops_organization}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
-                "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
-                "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
-                "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
-                "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
-                "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
-            )
-            
-            logger.info("Running remote agent task...")
-            final_text = await execute_agent_run(
-                prompt=prompt_content,
-                system_instruction=system_instruction,
-                tools=gemini_tools,
-                mcp_session=mcp_session
-            )
-            
-            logger.info("=== FINAL AGENT RESPONSE ===")
-            logger.info(final_text)
-            logger.info("============================")
-            
+        subagent = determine_subagent_role(prompt_content)
+        gemini_tools = filter_tools_for_role(subagent["name"], mcp_tools)
+        subagent_name = subagent["name"]
+        
+        logger.info(f"Active Profile: {subagent_name}")
+        system_instruction = (
+            f"You are the {subagent['name']} subagent. {subagent['instruction']}\n"
+            "To conserve API quota, you MUST follow these constraints:\n"
+            f"1. The default project is '{config.azure_devops_organization}' and the default repository is '{config.default_repo}'. ALWAYS assume these defaults. Do NOT query projects or repository list unless the user explicitly asks to list them or specifies a different project/repository.\n"
+            "2. Minimize tool calls. Only call tools that are absolutely necessary to answer the prompt.\n"
+            "3. If a tool call returns empty or fails, DO NOT retry it. Report the failure/empty state immediately to the user.\n"
+            "4. Call tools in parallel in a single turn whenever possible instead of running them sequentially across multiple turns.\n"
+            "5. Do not perform redundant queries (e.g. if you already listed branches, do not list them again).\n"
+            "6. Act fully autonomously. Never ask the user for confirmation, permission, or approval before executing writing or mutating actions (like creating/updating work items, updating team capacity, assigning iterations, creating branches, or writing wiki pages). Execute them immediately."
+        )
+        
+        logger.info("Running remote agent task...")
+        final_text = await execute_agent_run(
+            prompt=prompt_content,
+            system_instruction=system_instruction,
+            tools=gemini_tools,
+            mcp_session=mcp_session
+        )
+        
+        logger.info("=== FINAL AGENT RESPONSE ===")
+        logger.info(final_text)
+        logger.info("============================")
+        
     except Exception as err:
         logger.critical(f"CLI execution failed: {err}", exc_info=True)
 
